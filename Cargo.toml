@@ -1,0 +1,19 @@
+[package]
+name = "MysqlCli"
+version = "0.1.0"
+edition = "2024"
+authors = ["ounisaki"]
+
+[dependencies]
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "mysql"] }
+tokio = { version = "1", features = ["full"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+console = "0.15"
+tabled = "0.16"
+owo-colors = { version = "3.5.0", features = ["supports-colors"] }
+serde_json = "1.0"
+csv = "1.3"
+anyhow = "1.0"
+dirs = "5.0"
+chrono = "0.4"
+tempfile = "3.9"
