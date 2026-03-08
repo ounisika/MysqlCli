@@ -5,7 +5,7 @@ use console::{style, Term};
 use csv::ReaderBuilder;
 use dialoguer::{Confirm, Input, Select};
 use owo_colors::OwoColorize;
-use serde_json::Value;
+use serde_json::{to_string, Value};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Column, MySqlPool, Row, TypeInfo};
 use std::collections::HashMap;
@@ -216,8 +216,249 @@ impl DatabaseService {
         }
         Ok(columns)
     }
+
+    async fn query_data(&self,table: &str, limit:usize,offset:usize,where_clause: Option<&str>)
+        -> Result<(Vec<String>, Vec<Vec<String>>)>{
+        let sql = if let Some(w) = where_clause{
+            format!("SELECT * FROM `{}` WHERE {} LIMIT {} OFFSET {}",table,w,limit,offset)
+        } else {
+            format!("SELECT * FROM `{}` LIMIT {} OFFSET {}",table,limit,offset)
+        };
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+
+        if rows.is_empty(){
+            return Ok((vec![], vec![]));
+        }
+
+        let headers:Vec<String> = rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+
+        let data:Vec<Vec<String>> =rows
+            .iter()
+            .map(|row|{
+                headers.iter()
+                    .enumerate()
+                    .map(|(i,_)| self.value_to_string(row,i))
+                    .collect()
+            }).collect();
+
+        Ok((headers,data))
+    }
+
+    fn value_to_string(&self,row:&sqlx::mysql::MySqlRow,index:usize) -> String{
+        if let Ok(val) = row.try_get::<Option<String>,_>(index){
+            val.unwrap_or_else(||"NULL".to_string())
+        }else if let Ok(val) = row.try_get::<Option<f64>,_>(index) {
+            val.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string())
+        }else if let Ok(val) = row.try_get::<Option<i64>,_>(index){
+            val.map(|v| format!("{:.2}",v)).unwrap_or_else(|| "NULL".to_string())
+        }else {
+            "<?>".to_string()
+        }
+    }
+
+    //统计行数
+    async fn count_rows(&self,table: &str,where_clause: &str) -> Result<usize> {
+        let sql = format!("SELECT COUNT(*) FROM `{}` WHERE {}", table, where_clause);
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
+        let count: i64 = row.try_get("c")?;
+        Ok(count as usize)
+    }
+
+    //插入单行
+    async fn insert_row(&self, table: &str,data: &HashMap<String, String>) ->Result<u64> {
+        if data.is_empty(){
+            return Err(anyhow!("没有数据要插入！"));
+        }
+
+        let columns: Vec<_> = data.keys().map(|k|format!("`{}`",k)).collect();
+        let placeholders:Vec<_> = data.keys().map(|_| "?").collect();
+
+        //翻译成SQL指令
+        let sql = format!(
+            "INSERT INTO `{}` ({}) VALUES ({})",
+            table,
+            columns.join(", "),
+            placeholders.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql);
+        for key in data.keys(){
+            query = query.bind(data.get(key).unwrap());
+        }
+
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    //更新指定单元格
+    async fn update_cell(&self,table: &str,primary_key: &str,pk_value: &str,column: &str,new_value: &str) ->Result<u64>{
+        let sql = format!(
+            "UPDATE `{}` SET `{}` = ? WHERE `{}` = ? LIMIT 1",
+            table, column, primary_key
+        );
+
+        let result = sqlx::query(&sql)
+            .bind(new_value)
+            .bind(pk_value)
+            .execute(&self.pool).await?;
+
+        Ok(result.rows_affected())
+    }
+
+    //删除单行
+    async fn delete_row(&self, table: &str,where_clause: &str) -> Result<u64> {
+        let sql = format!("DELETE FROM `{}` WHERE {}", table, where_clause);
+        let result = sqlx::query(&sql).execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
 }
 
+//程序状态
+enum AppState {
+    Mainmenu,
+    TableMenu(String),
+    ViewData(String, usize, Option<String>),
+    AddRecord(String),
+    QuickEdit(String, String),
+    BatchInsert(String),
+    BatchDelete(String),
+    BuildWhere(String),
+}
+
+//初始化App数据
+struct App{
+    ui: RetroUI,
+    config: AppConfig,
+    db: DatabaseService,
+    state: AppState,
+    pending_where_clause: Option<String>,
+}
+
+//主App功能实现
+impl App {
+    async fn new(config:AppConfig) -> Result<Self>{
+        //链接数据库
+        let db = DatabaseService::connect(&config).await?;
+        Ok(Self{
+            ui:RetroUI::new(),
+            db,
+            config,
+            state:AppState::Mainmenu,
+            pending_where_clause:None,
+        })
+    }
+
+    //CLI状态机主循环
+    async fn run(&mut self) -> Result<()>{
+        loop{
+            match &self.state{
+                AppState::Mainmenu => self.main_menu().await?,
+                AppState::TableMenu(table) => {
+                    let table = table.clone();
+                    self.table_menu(&table).await?;
+                },
+                AppState::ViewData(table,page,filter){
+                    let table = table.clone();
+                    let page = *page;
+                    let filter = filter.clone();
+                    self.view_data(&table, page, filter.as_deref()).await?
+                },
+            }
+        }
+    }
+
+    ////////////////////////以下区域为页面实现//////////////////////////////////////////
+    //主页面实现
+    async fn main_menu(&mut self) ->Result<()>{
+        //清屏
+        self.ui.Clear();
+        //设置标题
+        self.ui.header("Mysql-CLI");
+
+        let tables = self.db.get_tables().await?;
+
+        println!("{}\n", "请选择要操作的表：".bold());
+
+        let items:Vec<String> = tables
+            .iter()
+            .map(|t| format!("{:<20} ({} 条记录)", t.name, t.row_count))
+            .collect();
+
+        let selection = Select::new()
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        let selected_table = tables[selection].name.clone();
+        self.state = AppState::TableMenu(selected_table);
+        Ok(())
+    }
+    //菜单页面
+    async fn table_menu(&mut self,table: &str) ->Result<()>{
+        self.ui.Clear();
+        self.ui.breadcrumb(&["主菜单",table]);
+
+        //菜单选项
+        let options = vec![
+            "查看数据",
+            "插入单条数据",
+            "批量导入",
+            "修改单条记录",
+            "批量删除记录",
+            "查看表结构",
+            "返回上级",
+        ];
+        let selection = Select::new()
+            .with_prompt("请选择操作")
+            .items(&options)
+            .default(0)
+            .interact()?;
+
+        match selection{
+            0 => self.state = AppState::ViewData(table.to_string(), 0, None),
+            1 =>{
+                if self.check_readonly() {return Ok(());}
+                self.state = AppState::AddRecord(table.to_string());
+            },
+            2 => {
+                if self.check_readonly() { return Ok(()); }
+                self.state = AppState::BatchInsert(table.to_string());
+            },
+            3 => {
+                if self.check_readonly() { return Ok(()); }
+                self.state = AppState::ViewData(table.to_string(), 0, None);
+            },
+            4 => {
+                if self.check_readonly() { return Ok(()); }
+                self.state = AppState::BatchDelete(table.to_string());
+            },
+            5 => self.show_schema(table).await?,
+            6 => self.state = AppState::Mainmenu,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_readonly(&self) -> bool {
+        if self.config.read_only {
+            self.ui.error("当前为只读模式，禁止修改数据");
+            self.ui.wait_for_key();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn view_data(&mut self, table: &str, page: usize, filter: Option<&str>) -> Result<()> {
+        self.ui.Clear();
+
+        let breadcrumb
+    }
+}
 
 fn main() {
 }
